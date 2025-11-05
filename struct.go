@@ -100,6 +100,19 @@ type ColumnMapping struct {
 	description string      `yaml:"description"`
 }
 
+// ClientLabelKey is a composite key for grouping client metrics by database, user, and application_name
+type ClientLabelKey struct {
+	database        string
+	user            string
+	applicationName string
+}
+
+// ClientMetrics tracks aggregated metrics for a group of clients
+type ClientMetrics struct {
+	count       float64
+	totalWaitUs float64
+}
+
 // Exporter collects PgBouncer stats from the given server and exports
 // them using the prometheus metrics package.
 type Exporter struct {

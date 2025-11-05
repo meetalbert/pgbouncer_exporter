@@ -135,6 +135,16 @@ var (
 		"The pgbouncer scrape succeeded",
 		nil, nil,
 	)
+	clientsCountDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clients", "count"),
+		"Current number of client connections",
+		[]string{"database", "user", "application_name"}, nil,
+	)
+	clientsAvgWaitMicrosecondsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clients", "avg_wait_microseconds"),
+		"Average wait time for client connections in microseconds",
+		[]string{"database", "user", "application_name"}, nil,
+	)
 )
 
 func NewExporter(connectionString string, namespace string, logger *slog.Logger) *Exporter {
@@ -236,6 +246,125 @@ func queryShowConfig(ch chan<- prometheus.Metric, db *sql.DB, logger *slog.Logge
 	}
 	return nil
 }
+
+// Query SHOW CLIENTS to get aggregated metrics. Returns non-fatal errors if
+// the aggregation fails, and a fatal error if the query itself fails.
+func queryShowClientsAggregates(ch chan<- prometheus.Metric, db *sql.DB, logger *slog.Logger) ([]error, error) {
+	rows, err := db.Query("SHOW CLIENTS;")
+	if err != nil {
+		return []error{}, fmt.Errorf("error running SHOW CLIENTS on database: %w", err)
+	}
+
+	defer rows.Close()
+
+	columnNames, err := rows.Columns()
+	if err != nil {
+		return []error{}, fmt.Errorf("error retrieving column list for SHOW CLIENTS: %w", err)
+	}
+
+	// Build column index map
+	columnIdx := make(map[string]int, len(columnNames))
+	for i, n := range columnNames {
+		columnIdx[n] = i
+	}
+
+	// Check if required columns exist
+	databaseIdx, hasDatabase := columnIdx["database"]
+	userIdx, hasUser := columnIdx["user"]
+	appNameIdx, hasAppName := columnIdx["application_name"]
+	waitUsIdx, hasWaitUs := columnIdx["wait_us"]
+	if !hasDatabase || !hasUser || !hasAppName || !hasWaitUs {
+		return []error{}, fmt.Errorf("SHOW CLIENTS missing required columns (database, user, application_name, or wait_us)")
+	}
+
+	// Prepare scan arguments
+	columnData := make([]interface{}, len(columnNames))
+	scanArgs := make([]interface{}, len(columnNames))
+	for i := range columnData {
+		scanArgs[i] = &columnData[i]
+	}
+
+	// Track per-app metrics with composite key
+	appStats := make(map[ClientLabelKey]*ClientMetrics)
+	nonfatalErrors := []error{}
+
+	for rows.Next() {
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nonfatalErrors, fmt.Errorf("error retrieving SHOW CLIENTS rows: %w", err)
+		}
+
+		// Extract label values
+		database, err := dbToString(columnData[databaseIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing database column: %w", err))
+			database = "unknown"
+		}
+
+		user, err := dbToString(columnData[userIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing user column: %w", err))
+			user = "unknown"
+		}
+
+		appName, err := dbToString(columnData[appNameIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing application_name column: %w", err))
+			appName = "unknown"
+		}
+
+		// Extract wait_us
+		waitUs, ok := dbToFloat64(columnData[waitUsIdx], 1.0)
+		if !ok || math.IsNaN(waitUs) {
+			waitUs = 0.0
+		}
+
+		// Create composite key and update stats
+		key := ClientLabelKey{
+			database:        database,
+			user:            user,
+			applicationName: appName,
+		}
+		if _, exists := appStats[key]; !exists {
+			appStats[key] = &ClientMetrics{}
+		}
+		appStats[key].count++
+		appStats[key].totalWaitUs += waitUs
+	}
+
+	if err := rows.Err(); err != nil {
+		return nonfatalErrors, fmt.Errorf("error iterating SHOW CLIENTS rows: %w", err)
+	}
+
+	// Emit metrics for each database/user/application_name combination
+	for key, stats := range appStats {
+		// Client count per combination
+		ch <- prometheus.MustNewConstMetric(
+			clientsCountDesc,
+			prometheus.GaugeValue,
+			stats.count,
+			key.database,
+			key.user,
+			key.applicationName,
+		)
+
+		// Average wait time per combination (in microseconds)
+		avgWaitUs := 0.0
+		if stats.count > 0 {
+			avgWaitUs = stats.totalWaitUs / stats.count
+		}
+		ch <- prometheus.MustNewConstMetric(
+			clientsAvgWaitMicrosecondsDesc,
+			prometheus.GaugeValue,
+			avgWaitUs,
+			key.database,
+			key.user,
+			key.applicationName,
+		)
+	}
+
+	return nonfatalErrors, nil
+}
+
 
 // Query within a namespace mapping and emit metrics. Returns fatal errors if
 // the scrape fails, and a slice of errors if they were non-fatal.
@@ -382,6 +511,32 @@ func dbToFloat64(t interface{}, factor float64) (float64, bool) {
 	}
 }
 
+// Convert database.sql types to strings for label values. Handles string, []byte, and nil types.
+// Returns "unknown" for nil/empty values and "invalid" for non-UTF8 strings.
+func dbToString(t interface{}) (string, error) {
+	var result string
+	switch v := t.(type) {
+	case string:
+		result = v
+	case []byte:
+		result = string(v)
+	case nil:
+		result = ""
+	default:
+		return "", fmt.Errorf("unexpected type %T", v)
+	}
+
+	// Handle empty or invalid UTF-8
+	if result == "" {
+		return "unknown", nil
+	}
+	if !utf8.ValidString(result) {
+		return "invalid", fmt.Errorf("invalid UTF-8 string")
+	}
+
+	return result, nil
+}
+
 // Iterate through all the namespace mappings in the exporter and run their queries.
 func queryNamespaceMappings(ch chan<- prometheus.Metric, db *sql.DB, metricMap map[string]MetricMapNamespace, logger *slog.Logger) map[string]error {
 	// Return a map of namespace -> errors
@@ -501,6 +656,17 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	if err = queryShowConfig(ch, db, e.logger); err != nil {
 		e.logger.Warn("error getting SHOW CONFIG", "err", err.Error())
 		up = 0
+	}
+
+	nonFatalErrors, err := queryShowClientsAggregates(ch, db, e.logger)
+	if err != nil {
+		e.logger.Warn("error getting SHOW CLIENTS aggregates", "err", err.Error())
+		up = 0
+	}
+	if len(nonFatalErrors) > 0 {
+		for _, err := range nonFatalErrors {
+			e.logger.Info("error parsing SHOW CLIENTS", "err", err.Error())
+		}
 	}
 
 	errMap := queryNamespaceMappings(ch, db, e.metricMap, e.logger)
