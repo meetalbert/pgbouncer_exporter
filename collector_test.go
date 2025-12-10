@@ -208,3 +208,177 @@ func testQueryNamespaceMapping(t *testing.T, namespaceMapping string, rows *sqlm
 		t.Errorf("there were unfulfilled exceptions: %s", err)
 	}
 }
+
+func TestQueryShowClientsAggregates(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error opening a stub db connection: %s", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows([]string{"database", "user", "application_name", "wait_us", "ptr", "link", "state"}).
+		AddRow("pg0", "user1", "app1", 1000, "0x123", "0x456", "active").
+		AddRow("pg0", "user1", "app1", 2000, "0x789", "0xabc", "active").
+		AddRow("pg0", "user1", "app2", 3000, "0xdef", "0x111", "active").
+		AddRow("pg1", "user2", "app1", 4000, "0x222", "0x333", "active").
+		AddRow("pg1", "user2", "", 5000, "0x444", "0x555", "waiting")
+
+	mock.ExpectQuery("SHOW CLIENTS;").WillReturnRows(rows)
+	logger := slog.Default()
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		defer close(ch)
+		if _, err := queryShowClientsAggregates(ch, db, logger); err != nil {
+			t.Errorf("Error running queryShowClientsAggregates: %s", err)
+		}
+	}()
+
+	// Expected metrics:
+	// pg0, user1, app1: count=2, avg_wait_us=(1000+2000)/2=1500
+	// pg0, user1, app2: count=1, avg_wait_us=3000
+	// pg1, user2, app1: count=1, avg_wait_us=4000
+	// pg1, user2, unknown: count=1, avg_wait_us=5000 (empty application_name becomes "unknown")
+	expected := []MetricResult{
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 2},
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 1500},
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app2"}, metricType: dto.MetricType_GAUGE, value: 1},
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app2"}, metricType: dto.MetricType_GAUGE, value: 3000},
+		{labels: labelMap{"database": "pg1", "user": "user2", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 1},
+		{labels: labelMap{"database": "pg1", "user": "user2", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 4000},
+		{labels: labelMap{"database": "pg1", "user": "user2", "application_name": "unknown"}, metricType: dto.MetricType_GAUGE, value: 1},
+		{labels: labelMap{"database": "pg1", "user": "user2", "application_name": "unknown"}, metricType: dto.MetricType_GAUGE, value: 5000},
+	}
+
+	// Collect all metrics
+	var results []MetricResult
+	for m := range ch {
+		results = append(results, readMetric(m))
+	}
+
+	convey.Convey("Metrics comparison", t, func() {
+		convey.So(len(results), convey.ShouldEqual, len(expected))
+
+		// Since map iteration order is non-deterministic, we need to match metrics by labels
+		for _, expect := range expected {
+			found := false
+			for _, result := range results {
+				if mapsEqual(expect.labels, result.labels) && expect.value == result.value && expect.metricType == result.metricType {
+					found = true
+					break
+				}
+			}
+			convey.So(found, convey.ShouldBeTrue)
+		}
+	})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled exceptions: %s", err)
+	}
+}
+
+func TestQueryShowClientsAggregatesSingleClient(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error opening a stub db connection: %s", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows([]string{"database", "user", "application_name", "wait_us"}).
+		AddRow("pg0", "user1", "app1", 1500)
+
+	mock.ExpectQuery("SHOW CLIENTS;").WillReturnRows(rows)
+	logger := slog.Default()
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		defer close(ch)
+		if _, err := queryShowClientsAggregates(ch, db, logger); err != nil {
+			t.Errorf("Error running queryShowClientsAggregates: %s", err)
+		}
+	}()
+
+	expected := []MetricResult{
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 1},
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 1500},
+	}
+
+	convey.Convey("Metrics comparison", t, func() {
+		for _, expect := range expected {
+			m := readMetric(<-ch)
+			convey.So(m, convey.ShouldResemble, expect)
+		}
+	})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled exceptions: %s", err)
+	}
+}
+
+func TestQueryShowClientsAggregatesNilValues(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Error opening a stub db connection: %s", err)
+	}
+	defer db.Close()
+
+	rows := sqlmock.NewRows([]string{"database", "user", "application_name", "wait_us"}).
+		AddRow(nil, nil, nil, 1000).
+		AddRow("pg0", "user1", "app1", nil)
+
+	mock.ExpectQuery("SHOW CLIENTS;").WillReturnRows(rows)
+	logger := slog.Default()
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		defer close(ch)
+		if _, err := queryShowClientsAggregates(ch, db, logger); err != nil {
+			t.Errorf("Error running queryShowClientsAggregates: %s", err)
+		}
+	}()
+
+	// Expected: nil values should be converted to "unknown" for labels and 0 for wait_us
+	expected := []MetricResult{
+		{labels: labelMap{"database": "unknown", "user": "unknown", "application_name": "unknown"}, metricType: dto.MetricType_GAUGE, value: 1},
+		{labels: labelMap{"database": "unknown", "user": "unknown", "application_name": "unknown"}, metricType: dto.MetricType_GAUGE, value: 1000},
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 1},
+		{labels: labelMap{"database": "pg0", "user": "user1", "application_name": "app1"}, metricType: dto.MetricType_GAUGE, value: 0},
+	}
+
+	var results []MetricResult
+	for m := range ch {
+		results = append(results, readMetric(m))
+	}
+
+	convey.Convey("Metrics comparison", t, func() {
+		convey.So(len(results), convey.ShouldEqual, len(expected))
+
+		for _, expect := range expected {
+			found := false
+			for _, result := range results {
+				if mapsEqual(expect.labels, result.labels) && expect.value == result.value && expect.metricType == result.metricType {
+					found = true
+					break
+				}
+			}
+			convey.So(found, convey.ShouldBeTrue)
+		}
+	})
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("there were unfulfilled exceptions: %s", err)
+	}
+}
+
+// Helper function to compare label maps
+func mapsEqual(a, b labelMap) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
