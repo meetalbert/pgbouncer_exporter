@@ -148,6 +148,21 @@ var (
 		"The pgbouncer scrape succeeded",
 		nil, nil,
 	)
+	clientSnapshotCountDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "client_snapshot", "count"),
+		"Snapshot count of client connections (unreliable, may change between scrapes)",
+		[]string{"database", "user", "application_name"}, nil,
+	)
+	clientSnapshotAvgWaitMicrosecondsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "client_snapshot", "avg_wait_microseconds"),
+		"Snapshot average wait time for client connections in microseconds (unreliable, may change between scrapes)",
+		[]string{"database", "user", "application_name"}, nil,
+	)
+	serverSnapshotCountDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "server_snapshot", "count"),
+		"Snapshot count of server connections (unreliable, may change between scrapes)",
+		[]string{"database", "user", "state"}, nil,
+	)
 )
 
 func NewExporter(connectionString string, namespace string, logger *slog.Logger) *Exporter {
@@ -248,6 +263,221 @@ func queryShowConfig(ch chan<- prometheus.Metric, db *sql.DB, logger *slog.Logge
 		}
 	}
 	return nil
+}
+
+// Query SHOW CLIENTS to get aggregated snapshot metrics. Returns non-fatal errors if
+// the aggregation fails, and a fatal error if the query itself fails.
+// Note: These metrics are point-in-time snapshots and may vary between scrapes.
+func queryShowClientsSnapshot(ch chan<- prometheus.Metric, db *sql.DB, logger *slog.Logger) ([]error, error) {
+	rows, err := db.Query("SHOW CLIENTS;")
+	if err != nil {
+		return []error{}, fmt.Errorf("error running SHOW CLIENTS on database: %w", err)
+	}
+
+	defer rows.Close()
+
+	columnNames, err := rows.Columns()
+	if err != nil {
+		return []error{}, fmt.Errorf("error retrieving column list for SHOW CLIENTS: %w", err)
+	}
+
+	// Build column index map
+	columnIdx := make(map[string]int, len(columnNames))
+	for i, n := range columnNames {
+		columnIdx[n] = i
+	}
+
+	// Check if required columns exist
+	databaseIdx, hasDatabase := columnIdx["database"]
+	userIdx, hasUser := columnIdx["user"]
+	appNameIdx, hasAppName := columnIdx["application_name"]
+	waitUsIdx, hasWaitUs := columnIdx["wait_us"]
+	if !hasDatabase || !hasUser || !hasAppName || !hasWaitUs {
+		return []error{}, fmt.Errorf("SHOW CLIENTS missing required columns (database, user, application_name, or wait_us)")
+	}
+
+	// Prepare scan arguments
+	columnData := make([]interface{}, len(columnNames))
+	scanArgs := make([]interface{}, len(columnNames))
+	for i := range columnData {
+		scanArgs[i] = &columnData[i]
+	}
+
+	// Track per-app metrics with composite key
+	stats := make(map[SnapshotLabelKey]*SnapshotMetrics)
+	nonfatalErrors := []error{}
+
+	for rows.Next() {
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nonfatalErrors, fmt.Errorf("error retrieving SHOW CLIENTS rows: %w", err)
+		}
+
+		// Extract label values
+		database, err := dbToString(columnData[databaseIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing database column: %w", err))
+			database = "unknown"
+		}
+
+		user, err := dbToString(columnData[userIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing user column: %w", err))
+			user = "unknown"
+		}
+
+		appName, err := dbToString(columnData[appNameIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing application_name column: %w", err))
+			appName = "unknown"
+		}
+
+		// Extract wait_us
+		waitUs, ok := dbToFloat64(columnData[waitUsIdx], 1.0)
+		if !ok || math.IsNaN(waitUs) {
+			waitUs = 0.0
+		}
+
+		// Create composite key and update stats
+		key := SnapshotLabelKey{
+			database:        database,
+			user:            user,
+			applicationName: appName,
+		}
+		if _, exists := stats[key]; !exists {
+			stats[key] = &SnapshotMetrics{}
+		}
+		stats[key].count++
+		stats[key].totalWaitUs += waitUs
+	}
+
+	if err := rows.Err(); err != nil {
+		return nonfatalErrors, fmt.Errorf("error iterating SHOW CLIENTS rows: %w", err)
+	}
+
+	// Emit metrics for each database/user/application_name combination
+	for key, metrics := range stats {
+		// Client count per combination
+		ch <- prometheus.MustNewConstMetric(
+			clientSnapshotCountDesc,
+			prometheus.GaugeValue,
+			metrics.count,
+			key.database,
+			key.user,
+			key.applicationName,
+		)
+
+		// Average wait time per combination (in microseconds)
+		avgWaitUs := 0.0
+		if metrics.count > 0 {
+			avgWaitUs = metrics.totalWaitUs / metrics.count
+		}
+		ch <- prometheus.MustNewConstMetric(
+			clientSnapshotAvgWaitMicrosecondsDesc,
+			prometheus.GaugeValue,
+			avgWaitUs,
+			key.database,
+			key.user,
+			key.applicationName,
+		)
+	}
+
+	return nonfatalErrors, nil
+}
+
+// Query SHOW SERVERS to get aggregated snapshot metrics. Returns non-fatal errors if
+// the aggregation fails, and a fatal error if the query itself fails.
+// Note: These metrics are point-in-time snapshots and may vary between scrapes.
+func queryShowServersSnapshot(ch chan<- prometheus.Metric, db *sql.DB, logger *slog.Logger) ([]error, error) {
+	rows, err := db.Query("SHOW SERVERS;")
+	if err != nil {
+		return []error{}, fmt.Errorf("error running SHOW SERVERS on database: %w", err)
+	}
+
+	defer rows.Close()
+
+	columnNames, err := rows.Columns()
+	if err != nil {
+		return []error{}, fmt.Errorf("error retrieving column list for SHOW SERVERS: %w", err)
+	}
+
+	// Build column index map
+	columnIdx := make(map[string]int, len(columnNames))
+	for i, n := range columnNames {
+		columnIdx[n] = i
+	}
+
+	// Check if required columns exist
+	databaseIdx, hasDatabase := columnIdx["database"]
+	userIdx, hasUser := columnIdx["user"]
+	stateIdx, hasState := columnIdx["state"]
+	if !hasDatabase || !hasUser || !hasState {
+		return []error{}, fmt.Errorf("SHOW SERVERS missing required columns (database, user, or state)")
+	}
+
+	// Prepare scan arguments
+	columnData := make([]interface{}, len(columnNames))
+	scanArgs := make([]interface{}, len(columnNames))
+	for i := range columnData {
+		scanArgs[i] = &columnData[i]
+	}
+
+	// Track per-state metrics with composite key
+	stats := make(map[SnapshotLabelKey]*SnapshotMetrics)
+	nonfatalErrors := []error{}
+
+	for rows.Next() {
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nonfatalErrors, fmt.Errorf("error retrieving SHOW SERVERS rows: %w", err)
+		}
+
+		// Extract label values
+		database, err := dbToString(columnData[databaseIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing database column: %w", err))
+			database = "unknown"
+		}
+
+		user, err := dbToString(columnData[userIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing user column: %w", err))
+			user = "unknown"
+		}
+
+		state, err := dbToString(columnData[stateIdx])
+		if err != nil {
+			nonfatalErrors = append(nonfatalErrors, fmt.Errorf("error parsing state column: %w", err))
+			state = "unknown"
+		}
+
+		// Create composite key and update stats
+		key := SnapshotLabelKey{
+			database:        database,
+			user:            user,
+			applicationName: state, // Reuse the field for state
+		}
+		if _, exists := stats[key]; !exists {
+			stats[key] = &SnapshotMetrics{}
+		}
+		stats[key].count++
+	}
+
+	if err := rows.Err(); err != nil {
+		return nonfatalErrors, fmt.Errorf("error iterating SHOW SERVERS rows: %w", err)
+	}
+
+	// Emit metrics for each database/user/state combination
+	for key, metrics := range stats {
+		ch <- prometheus.MustNewConstMetric(
+			serverSnapshotCountDesc,
+			prometheus.GaugeValue,
+			metrics.count,
+			key.database,
+			key.user,
+			key.applicationName, // This is the state
+		)
+	}
+
+	return nonfatalErrors, nil
 }
 
 // Query within a namespace mapping and emit metrics. Returns fatal errors if
@@ -395,6 +625,32 @@ func dbToFloat64(t interface{}, factor float64) (float64, bool) {
 	}
 }
 
+// Convert database.sql types to strings for label values. Handles string, []byte, and nil types.
+// Returns "unknown" for nil/empty values and "invalid" for non-UTF8 strings.
+func dbToString(t interface{}) (string, error) {
+	var result string
+	switch v := t.(type) {
+	case string:
+		result = v
+	case []byte:
+		result = string(v)
+	case nil:
+		result = ""
+	default:
+		return "", fmt.Errorf("unexpected type %T", v)
+	}
+
+	// Handle empty or invalid UTF-8
+	if result == "" {
+		return "unknown", nil
+	}
+	if !utf8.ValidString(result) {
+		return "invalid", fmt.Errorf("invalid UTF-8 string")
+	}
+
+	return result, nil
+}
+
 // Iterate through all the namespace mappings in the exporter and run their queries.
 func queryNamespaceMappings(ch chan<- prometheus.Metric, db *sql.DB, metricMap map[string]MetricMapNamespace, logger *slog.Logger) map[string]error {
 	// Return a map of namespace -> errors
@@ -514,6 +770,28 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	if err = queryShowConfig(ch, db, e.logger); err != nil {
 		e.logger.Warn("error getting SHOW CONFIG", "err", err.Error())
 		up = 0
+	}
+
+	nonFatalErrors, err := queryShowClientsSnapshot(ch, db, e.logger)
+	if err != nil {
+		e.logger.Warn("error getting SHOW CLIENTS snapshot", "err", err.Error())
+		up = 0
+	}
+	if len(nonFatalErrors) > 0 {
+		for _, err := range nonFatalErrors {
+			e.logger.Info("error parsing SHOW CLIENTS", "err", err.Error())
+		}
+	}
+
+	nonFatalErrors, err = queryShowServersSnapshot(ch, db, e.logger)
+	if err != nil {
+		e.logger.Warn("error getting SHOW SERVERS snapshot", "err", err.Error())
+		up = 0
+	}
+	if len(nonFatalErrors) > 0 {
+		for _, err := range nonFatalErrors {
+			e.logger.Info("error parsing SHOW SERVERS", "err", err.Error())
+		}
 	}
 
 	errMap := queryNamespaceMappings(ch, db, e.metricMap, e.logger)
