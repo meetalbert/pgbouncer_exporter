@@ -142,17 +142,18 @@ func TestQueryShowDatabases(t *testing.T) {
 }
 
 func TestQueryShowStats(t *testing.T) {
-	// columns are listed in the order PgBouncers exposes them, a value of -1 means pgbouncer_exporter does not expose this value as a metric
+	// columns are listed in the order PgBouncer SHOW STATS_TOTALS exposes them
 	rows := sqlmock.NewRows([]string{"database",
-		"server_assignment_count",
-		"xact_count", "query_count", "bytes_received", "bytes_sent",
+		"xact_count", "query_count", "server_assignment_count", "bytes_received", "bytes_sent",
 		"xact_time", "query_time", "wait_time", "client_parse_count", "server_parse_count", "bind_count"}).
-		AddRow("pg0", -1, 10, 40, 220, 460, 6, 8, 9, 5, 55, 555)
+		AddRow("pg0", 10, 40, 100, 220, 460, 6, 8, 9, 5, 55, 555)
 
-	// expected metrics are returned in the same order as the colums
+	// expected metrics are returned in the same order as the columns (skipping label columns)
+	// Order matches: xact_count, query_count, server_assignment_count, bytes_received, bytes_sent, xact_time, query_time, wait_time, client_parse_count, server_parse_count, bind_count
 	expected := []MetricResult{
 		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_COUNTER, value: 10},   // xact_count
 		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_COUNTER, value: 40},   // query_count
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_COUNTER, value: 100},  // server_assignment_count
 		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_COUNTER, value: 220},  // bytes_received
 		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_COUNTER, value: 460},  // bytes_sent
 		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_COUNTER, value: 6e-6}, // xact_time
@@ -164,6 +165,33 @@ func TestQueryShowStats(t *testing.T) {
 	}
 
 	testQueryNamespaceMapping(t, "stats_totals", rows, expected)
+}
+
+func TestQueryShowStatsAverages(t *testing.T) {
+	// columns are listed in the order PgBouncer SHOW STATS_AVERAGES exposes them
+	rows := sqlmock.NewRows([]string{"database",
+		"xact_count", "query_count", "server_assignment_count", "bytes_received", "bytes_sent",
+		"xact_time", "query_time", "wait_time", "client_parse_count", "server_parse_count", "bind_count"}).
+		AddRow("pg0", 15.5, 42.3, 10.1, 250.7, 480.2, 12, 14, 18, 7, 60, 600)
+
+	// expected metrics are returned in the same order as the columns (skipping label columns)
+	// Order matches: xact_count, query_count, server_assignment_count, bytes_received, bytes_sent, xact_time, query_time, wait_time, client_parse_count, server_parse_count, bind_count
+	// Note: these are GAUGE types since they represent rates (per second)
+	expected := []MetricResult{
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 15.5},    // xact_count
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 42.3},    // query_count
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 10.1},    // server_assignment_count
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 250.7},   // bytes_received
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 480.2},   // bytes_sent
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 12e-6},   // xact_time
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 14e-6},   // query_time
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 18e-6},   // wait_time
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 7},       // client_parse_count
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 60},      // server_parse_count
+		{labels: labelMap{"database": "pg0"}, metricType: dto.MetricType_GAUGE, value: 600},     // bind_count
+	}
+
+	testQueryNamespaceMapping(t, "stats_averages", rows, expected)
 }
 
 func TestQueryShowPools(t *testing.T) {
