@@ -100,6 +100,19 @@ type ColumnMapping struct {
 	description string      `yaml:"description"`
 }
 
+// SnapshotLabelKey is a composite key for grouping snapshot metrics by database, user, and application_name
+type SnapshotLabelKey struct {
+	database        string
+	user            string
+	applicationName string
+}
+
+// SnapshotMetrics tracks aggregated metrics for a group of connections (clients or servers)
+type SnapshotMetrics struct {
+	count       float64
+	totalWaitUs float64
+}
+
 // Exporter collects PgBouncer stats from the given server and exports
 // them using the prometheus metrics package.
 type Exporter struct {
